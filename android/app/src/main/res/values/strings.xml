@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">BizFlow Pro</string>
+    <string name="title_activity_main">BizFlow Pro</string>
+    <string name="package_name">com.bizflowpro.app</string>
+    <string name="custom_url_scheme">com.bizflowpro.app</string>
+</resources>

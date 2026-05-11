@@ -1,0 +1,53 @@
+type User @table {
+  displayName: String!
+  email: String!
+  role: String!
+  createdAt: Timestamp!
+  photoUrl: String
+  phoneNumber: String
+}
+
+type Customer @table {
+  name: String!
+  createdAt: Timestamp!
+  email: String
+  phoneNumber: String
+  address: String
+}
+
+type Supplier @table {
+  name: String!
+  createdAt: Timestamp!
+  contactPerson: String
+  email: String
+  phoneNumber: String
+  address: String
+}
+
+type Project @table {
+  name: String!
+  status: String!
+  createdAt: Timestamp!
+  owner: User
+  description: String
+  deadline: Timestamp
+}
+
+type Task @table {
+  description: String!
+  status: String!
+  createdAt: Timestamp!
+  project: Project
+  assignee: User
+  dueDate: Timestamp
+}
+
+type Product @table {
+  name: String!
+  price: Float!
+  stockQuantity: Int!
+  createdAt: Timestamp!
+  supplier: Supplier
+  description: String
+  sku: String
+}

@@ -1,0 +1,28 @@
+{
+  "name": "finprox",
+  "version": "1.0.0",
+  "description": "FinProx - Business management system for sales and procurement",
+  "main": "app.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@capacitor/android": "^8.3.3",
+    "@capacitor/cli": "^8.3.3",
+    "@capacitor/core": "^8.3.3",
+    "body-parser": "^1.20.5",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.1",
+    "mysql2": "^3.22.3",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "glm": "^1.0.0"
+  }
+}
