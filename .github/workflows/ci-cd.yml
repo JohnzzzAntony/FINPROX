@@ -22,32 +22,10 @@ jobs:
     - name: Install dependencies
       run: npm install
       
-    - name: Install functions dependencies
-      run: cd functions && npm install
-      
+
     - name: Run linting (if available)
       run: npm run lint || echo "No lint script found"
       
     - name: Run tests (if available)
       run: npm test || echo "No test script found"
   
-  deploy:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: '18'
-        
-    - name: Install Firebase CLI
-      run: npm install -g firebase-tools
-      
-    - name: Deploy to Firebase
-      run: firebase deploy --only hosting,functions
-      env:
-        FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
