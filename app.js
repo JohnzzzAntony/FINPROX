@@ -1,18 +1,38 @@
 
 
 /* =========================================================
-   API CONFIG (SQL BACKEND)
+   API CONFIG (SQL BACKEND + SUPABASE AUTH)
    ========================================================= */
 const API = 'http://localhost:3000/api';
+const SUPABASE_URL = 'https://kcjsfxkqmhqzatidizgp.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtjanNmeGtxbWhxemF0aWRpemdwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODUzOTQwMiwiZXhwIjoyMDk0MTE1NDAyfQ.P5zCqhYPb3S9CTsKyd2iZ4uyzpAG4GPmDBrUhwTwYNA';
+
+/* =========================================================
+   SUPABASE AUTH CLIENT
+   ========================================================= */
+function initSupabase() {
+  if (typeof window.supabase !== 'undefined' && window.supabase) {
+    try {
+      window.supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      console.log('Supabase Auth initialized');
+    } catch (err) {
+      console.error('Supabase init error:', err);
+    }
+  } else {
+    console.warn('Supabase library not loaded yet, will retry...');
+    setTimeout(initSupabase, 500);
+  }
+}
 
 /* =========================================================
    STATE
    ========================================================= */
 const S = {
   user: null, role: 'admin', cid: null, v: 'dashboard',
-  fbReady: true, db: null, auth: null, fbError: '', // Now reusing fbReady for API status
+  apiReady: true, db: null, auth: null,
   company: { name:'My Company', address:'', phone:'', email:'', taxId:'', currency:'AED', accent:'#d97706' },
-  users:[], vendors:[], clients:[], quotations:[], lpos:[], grns:[], invoices:[], payments:[]
+  users:[], vendors:[], clients:[], quotations:[], lpos:[], grns:[], invoices:[], payments:[],
+  filterMyDocs: false
 };
 
 /* =========================================================
@@ -53,21 +73,23 @@ function saveAll() {
 }
 
 async function persist(table, data) {
-  saveAll(); // Keep local storage as a cache
+  saveAll();
   if (!S.cid) return;
-  
+
   if (table && data) {
-    // Single item update
     try {
-      await fetch(`${API}/${table}`, {
+      const resp = await fetch(`${API}/${table}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({...data, company_id: S.cid})
       });
-    } catch(e) { console.error('SQL Sync Error:', e) }
-  } else {
-    // Full sync (rarely used now)
-    console.log('Full sync requested');
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({error: 'Save failed'}));
+        console.error('SQL Sync Error:', err.error);
+      }
+    } catch(e) {
+      console.error('SQL Sync Error:', e);
+    }
   }
 }
 
@@ -93,100 +115,128 @@ function checkOverdue() {
   const t = td();
   S.invoices.forEach(i => { if ((i.status==='unpaid'||i.status==='partial') && i.dueDate && i.dueDate < t) i.status='overdue' });
 }
+function toggleMyDocs(type) {
+  S.filterMyDocs = !S.filterMyDocs;
+  rc();
+}
 
 /* =========================================================
-   FIREBASE INIT - BULLETPROOF
-   ========================================================= */
-function initFB() {
-  // Reusing this for API check
+    API INIT
+    ========================================================= */
+function initAPI() {
   fetch(`${API}/users?cid=primary`)
-    .then(() => { S.fbReady = true; console.log('SQL Backend connected') })
-    .catch(e => { 
-      S.fbReady = false; 
-      S.fbError = 'Cannot connect to SQL backend. Make sure npm start is running.';
-      console.warn(S.fbError);
+    .then(resp => {
+      if (resp.ok) {
+        S.apiReady = true;
+        console.log('Backend API connected');
+      } else {
+        S.apiReady = false;
+      }
+    })
+    .catch(e => {
+      S.apiReady = false;
+      console.warn('Backend connection issue');
     });
   return true;
 }
 
 async function loadCloudData() {
-  if (S.cid) {
-    try {
-      const resp = await fetch(`${API}/company/${S.cid}`);
-      if (resp.ok) S.company = await resp.json();
-      
-      const tables = ['vendors', 'clients', 'quotations', 'lpos', 'grns', 'invoices', 'payments', 'users', 'audit'];
-      for (const t of tables) {
-        const r = await fetch(`${API}/${t}?cid=${S.cid}`);
-        if (r.ok) S[t] = await r.json();
+  if (!S.cid) return;
+  try {
+    const resp = await fetch(`${API}/company/${S.cid}`);
+    if (resp.ok) {
+      const comp = await resp.json();
+      if (comp) S.company = comp;
+    }
+
+    const tables = ['vendors', 'clients', 'quotations', 'lpos', 'grns', 'invoices', 'payments', 'users', 'audit'];
+    const results = await Promise.allSettled(
+      tables.map(t => fetch(`${API}/${t}?cid=${S.cid}`).then(r => r.json()))
+    );
+    results.forEach((result, i) => {
+      if (result.status === 'fulfilled' && Array.isArray(result.value)) {
+        S[tables[i]] = result.value;
+      } else {
+        console.warn(`Failed to load ${tables[i]}:`, result.reason);
       }
-    } catch(e) { console.error('SQL load error:', e) }
+    });
+  } catch(e) {
+    console.error('SQL load error:', e);
+    S.apiReady = false;
   }
   checkOverdue();
 }
 
+async function syncData() {
+  const btn = event?.currentTarget;
+  if (btn) btn.innerHTML = '<i class="fas fa-sync-alt fa-spin"></i>';
+  await loadCloudData();
+  if (btn) btn.innerHTML = '<i class="fas fa-sync-alt"></i>';
+  toast('Data synchronized with server');
+  rc();
+}
+
 /* =========================================================
-   AUTHENTICATION
+   AUTHENTICATION (Supabase)
    ========================================================= */
-async function doLogin(e, p) {
-  // Master Admin Bypass (Local Logic)
-  if (e === 'admin@admin.com' && p === '123ewqasd') {
-    const u = {id:'admin_primary', name:'System Admin', email:'admin@admin.com', role:'admin', companyId:'primary'};
-    S.user = u; S.role = u.role; S.cid = u.companyId;
-    sv('session', {email:e, cid:'primary'});
-    await loadCloudData();
-    return true;
-  }
-  if (e === 'johns@admin.com' && p === '123ewqasd') {
-    const u = {id:'admin_johns', name:'John Admin', email:'johns@admin.com', role:'admin', company_id:'primary'};
-    S.user = u; S.role = u.role; S.cid = u.company_id;
-    sv('session', {email:e, cid:'primary'});
-    await loadCloudData();
-    return true;
-  }
-
+async function doLogin(email, password) {
   try {
-    const r = await fetch(`${API}/login`, {
+    const resp = await fetch(`${API}/login`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({email:e, password:p})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
     });
-    if (r.ok) {
-      const u = await r.json();
-      S.user = u; S.role = u.role; S.cid = u.company_id || u.companyId;
-      sv('session', {email:e, cid: S.cid});
-      await loadCloudData();
-      return true;
-    } else {
-      toast('Invalid email or password', 'e');
-      return false;
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: 'Login failed' }));
+      throw new Error(err.error || 'Login failed');
     }
-  } catch(x) {
-    toast('Server connection failed', 'e');
-    return false;
-  }
-}
 
-async function doRegister(n, e, p, r) {
-  try {
-    const ci = uid();
-    const u = {id: uid(), name:n, email:e, password:p, role:r, company_id:ci};
-    const comp = {id:ci, name:n+"'s Company", email:e, currency:'AED', accent:'#d97706'};
-    
-    await fetch(`${API}/company`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(comp) });
-    await fetch(`${API}/users`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(u) });
-    
-    S.user = u; S.role = r; S.cid = ci;
-    sv('session', {email:e, cid:ci});
+    const data = await resp.json();
+    const { token, user } = data;
+
+    S.token = token;
+    S.user = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      companyId: user.companyId || user.company_id
+    };
+    S.role = S.user.role;
+    S.cid = S.user.companyId || S.user.company_id || 'primary';
+    sv('session', {
+      email: user.email,
+      cid: S.cid,
+      role: S.user.role,
+      userId: user.id,
+      token: token
+    });
+
+    await loadCloudData();
     return true;
-  } catch(x) {
-    toast('Registration failed', 'e');
+  } catch (err) {
+    console.error('Login error:', err);
+    toast(err.message || 'Login failed', 'e');
     return false;
   }
 }
 
-function doLogout() {
-  S.user = null; sv('session', null);
+async function doLogout() {
+  const token = S.token;
+  if (token) {
+    try {
+      await fetch(`${API}/auth/logout`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+    } catch (e) {
+      console.warn('Logout API call failed:', e);
+    }
+  }
+  S.user = null;
+  S.token = null;
+  sv('session', null);
   render();
 }
 
@@ -215,10 +265,6 @@ function tmSb() {
    AUTH SCREEN
    ========================================================= */
 function rAuth() {
-  const fbStatus = S.fbReady
-    ? '<span style="color:var(--ok)"><i class="fas fa-circle" style="font-size:6px;vertical-align:middle"></i> Firebase Connected</span>'
-    : '<span style="color:#94a3b8"><i class="fas fa-circle" style="font-size:6px;vertical-align:middle"></i> Offline Mode</span>';
-
   document.getElementById('AP').innerHTML = `
   <div class="ab"><div style="width:420px;max-width:95%;position:relative;z-index:1">
     <div class="fu" style="text-align:center;margin-bottom:28px">
@@ -231,7 +277,6 @@ function rAuth() {
       <p style="color:#94a3b8;font-size:13px">Business Management System</p>
     </div>
     <div class="fu" style="animation-delay:.1s;background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.2);border-radius:18px;padding:32px;box-shadow:0 24px 80px rgba(0,0,0,0.3)" id="AF"></div>
-    ${S.fbError ? '<div class="fu" style="animation-delay:.2s;margin-top:16px;padding:12px 18px;background:rgba(255,255,255,0.05);border-radius:10px;font-size:12px;color:#94a3b8"><i class="fas fa-info-circle"></i> ' + S.fbError + '</div>' : ''}
   </div></div>`;
   showLogin();
 }
@@ -255,44 +300,12 @@ function showLogin() {
       <i class="fas fa-arrow-right"></i> Sign In
     </button>
     <p style="text-align:center;margin-top:14px;font-size:12px;color:var(--mt)">
-      No account? <a href="#" onclick="showReg();return false" style="color:var(--ac);font-weight:600;text-decoration:none">Create one</a>
+      Contact your Administrator if you need access.
     </p>`;
-  // Enter key support
   setTimeout(() => {
     const lpEl = document.getElementById('lp');
     if (lpEl) lpEl.addEventListener('keydown', e => { if (e.key === 'Enter') hLogin() });
   }, 50);
-}
-
-function showReg() {
-  const af = document.getElementById('AF');
-  if (!af) return;
-  af.innerHTML = `
-    <h2 style="font-size:20px;font-weight:800;margin-bottom:3px">Create account</h2>
-    <p style="color:var(--mt);font-size:13px;margin-bottom:20px">${S.fbReady ? 'Account will be created in Firebase' : 'Local account (offline mode)'}</p>
-    <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:4px">Full Name</label>
-      <input class="ip" id="rn" placeholder="John Smith">
-    </div>
-    <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:4px">Email</label>
-      <input class="ip" id="re" type="email" placeholder="you@company.com">
-    </div>
-    <div style="margin-bottom:14px">
-      <label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Password</label>
-      <input class="ip" id="rp" type="password" placeholder="Min 6 characters">
-    </div>
-    <div style="margin-bottom:20px">
-      <label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Role</label>
-      <select class="ip" id="rr"><option value="admin">Admin</option><option value="manager">Manager</option><option value="staff">Staff</option></select>
-    </div>
-    <div id="regErr"></div>
-    <button class="bt bp" style="width:100%;justify-content:center;padding:11px" onclick="hReg()">
-      <i class="fas fa-user-plus"></i> Create Account
-    </button>
-    <p style="text-align:center;margin-top:14px;font-size:12px;color:var(--mt)">
-      Have an account? <a href="#" onclick="showLogin();return false" style="color:var(--ac);font-weight:600;text-decoration:none">Sign in</a>
-    </p>`;
 }
 
 async function hLogin() {
@@ -305,54 +318,6 @@ async function hLogin() {
   }
   const ok = await doLogin(e, p);
   if (ok) { toast('Welcome back!'); render() }
-}
-
-async function hReg() {
-  const n = document.getElementById('rn')?.value || '';
-  const e = document.getElementById('re')?.value || '';
-  const p = document.getElementById('rp')?.value || '';
-  const r = document.getElementById('rr')?.value || 'admin';
-  if (!n || !e || !p) {
-    const el = document.getElementById('regErr');
-    if (el) el.innerHTML = '<div class="err-box"><i class="fas fa-exclamation-circle"></i> Please fill all fields</div>';
-    return;
-  }
-  if (p.length < 6) {
-    const el = document.getElementById('regErr');
-    if (el) el.innerHTML = '<div class="err-box"><i class="fas fa-exclamation-circle"></i> Password must be at least 6 characters</div>';
-    return;
-  }
-  const ok = await doRegister(n, e, p, r);
-  if (ok) { toast('Account created!'); render() }
-}
-
-/* =========================================================
-   DEMO LOGIN - GUARANTEED TO WORK
-   ========================================================= */
-function demoLogin() {
-  try {
-    // Clear all local data arrays
-    S.vendors = []; S.clients = []; S.quotations = []; 
-    S.lpos = []; S.grns = []; S.invoices = []; S.payments = [];
-    
-    // Set requested admin credentials
-    S.user = {id:'admin_primary', name:'System Admin', email:'admin@admin.com', role:'admin', companyId:'primary'};
-    S.users = [S.user];
-    S.role = 'admin'; S.cid = 'primary';
-    
-    // Default company profile
-    S.company = {name:'FinProx Admin', address:'Primary Operations', phone:'', email:'admin@admin.com', taxId:'ADM-001', currency:'AED', accent:'#d97706'};
-    
-    // Persist clean state
-    saveAll();
-    sv('session', {email:'admin@admin.com', demo:true});
-    
-    toast('Data reset. Logged in as Admin.');
-    render();
-  } catch(e) {
-    console.error('Reset error:', e);
-    alert('Reset error: ' + e.message);
-  }
 }
 
 /* =========================================================
@@ -408,6 +373,7 @@ function render() {
     <div style="background:#fff;border-bottom:1px solid var(--bd);padding:10px 22px;display:flex;align-items:center;gap:10px;flex-shrink:0">
       <button onclick="tmSb()" style="display:none;background:none;border:none;font-size:16px;color:var(--tx);cursor:pointer" id="mb"><i class="fas fa-bars"></i></button>
       <h2 style="font-size:17px;font-weight:800;flex:1" id="VT"></h2>
+      <button class="bt bs bsm" onclick="syncData()" title="Sync Data"><i class="fas fa-sync-alt"></i></button>
       <div id="VA"></div>
     </div>
     <div style="flex:1;overflow-y:auto;padding:22px" id="CA"></div>
@@ -432,6 +398,9 @@ function rc() {
    DASHBOARD
    ========================================================= */
 function vDash(e) {
+  const isAdminOrManager = ['admin','manager'].includes(S.role);
+  const isStaff = S.role === 'staff';
+
   // All roles see company-wide data (Global visibility)
   const mq = S.quotations;
   const ml = S.lpos;
@@ -527,10 +496,20 @@ async function delC(id){
    ========================================================= */
 function vQuotes(e,a){
   const isAdminOrManager = ['admin','manager'].includes(S.role);
-  a.innerHTML= '<button class="bt bp" onclick="qForm()"><i class="fas fa-plus"></i> New Quotation</button>';
-  const ls = S.quotations;
+  const isStaff = S.role === 'staff';
+  const isManager = S.role === 'manager';
+  
+  a.innerHTML = '<button class="bt bp" onclick="qForm()"><i class="fas fa-plus"></i> New Quotation</button>' + 
+    (isManager ? '<button class="bt bs" onclick="toggleMyDocs(\'q\')" style="margin-left:8px"><i class="fas fa-filter"></i> ' + (S.filterMyDocs ? 'All Docs' : 'My Docs') + '</button>' : '');
+  
+  let ls = S.quotations;
+  if (isStaff) {
+    ls = ls.filter(q => q.createdBy === S.user.name);
+  } else if (isManager && S.filterMyDocs) {
+    ls = ls.filter(q => q.createdBy === S.user.name);
+  }
   const cur = S.company.currency;
-e.innerHTML='<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"><input class="ip" placeholder="Search..." oninput="fTbl(\'qT\',this.value)" style="max-width:240px"><select class="ip" style="max-width:140px" onchange="fTblS(\'qT\',this.value)"><option value="">All Status</option><option value="pending">Pending</option><option value="revision">Revision</option><option value="approved">Approved</option><option value="sent">Sent</option><option value="accepted">Accepted</option><option value="rejected">Rejected</option></select></div><div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse" id="qT"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Quote #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Client</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Date</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Amount</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+ls.map(q=>'<tr class="tr" style="border-bottom:1px solid var(--bd)" data-n="'+(q.clientName||'').toLowerCase()+'" data-s="'+q.status+'"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+q.id+'</td><td style="padding:10px 14px;font-size:12px">'+q.clientName+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(q.createdAt)+'</td><td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right">'+cur+' '+fm(q.total)+'</td><td style="padding:10px 14px;text-align:center">'+tg(q.status)+'</td><td style="padding:10px 14px;text-align:right;white-space:nowrap">'+
+e.innerHTML='<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"><input class="ip" placeholder="Search..." oninput="fTbl(\'qT\',this.value)" style="max-width:240px"><select class="ip" style="max-width:140px" onchange="fTblS(\'qT\',this.value)"><option value="">All Status</option><option value="pending">Pending</option><option value="revision">Revision</option><option value="approved">Approved</option><option value="sent">Sent</option><option value="accepted">Accepted</option><option value="rejected">Rejected</option></select></div><div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse" id="qT"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Quote #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Client</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Created By</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Date</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Amount</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+ls.map(q=>'<tr class="tr" style="border-bottom:1px solid var(--bd)" data-n="'+(q.clientName||'').toLowerCase()+'" data-s="'+q.status+'"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+q.id+'</td><td style="padding:10px 14px;font-size:12px">'+q.clientName+'</td><td style="padding:10px 14px;font-size:11px;color:var(--mt)"><i class="fas fa-user" style="margin-right:4px"></i>'+(q.createdBy||'—')+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(q.createdAt)+'</td><td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right">'+cur+' '+fm(q.total)+'</td><td style="padding:10px 14px;text-align:center">'+tg(q.status)+'</td><td style="padding:10px 14px;text-align:right;white-space:nowrap">'+
   (q.status==='pending' && isAdminOrManager ? '<button class="bt bgg bsm" title="Approve" onclick="appQ(\''+q.id+'\')"><i class="fas fa-check"></i></button><button class="bt bdd bsm" title="Reject" onclick="rejQ(\''+q.id+'\')"><i class="fas fa-times"></i></button><button class="bt bs bsm" title="Request Changes" onclick="reqQ(\''+q.id+'\')"><i class="fas fa-undo"></i></button>':'')+
   ((q.status==='pending' || q.status==='rejected' || q.status==='revision') && (S.role==='staff' || isAdminOrManager) ? '<button class="bt bs bsm" title="Edit" onclick="qForm(\''+q.id+'\')"><i class="fas fa-edit"></i></button>':'')+
   (q.status==='approved' && isAdminOrManager ? '<button class="bt bp bsm" title="Send to Client" onclick="sendQ(\''+q.id+'\')"><i class="fas fa-paper-plane"></i></button>':'')+
@@ -538,7 +517,7 @@ e.innerHTML='<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"
   (q.status==='accepted' ? '<button class="bt bs bsm" title="View Linked Invoice" onclick="vL(\'invoices\')"><i class="fas fa-link"></i></button>':'')+
   (q.status==='sent' || q.status==='accepted' ? '<button class="bt bs bsm" title="PDF" onclick="genPDF(\'quotation\',\''+q.id+'\')"><i class="fas fa-file-pdf"></i></button>':'')+
   '<button class="bt bs bsm" title="History" onclick="vHist(\''+q.id+'\')"><i class="fas fa-history"></i></button>'+
-  '</td></tr>').join('')+'</tbody></table>'+( !ls.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-file-alt" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>No quotations yet</p></div>':'')+'</div>'}
+  '</td></tr>').join('')+'</tbody></table>'+(!ls.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-file-alt" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>'+(isStaff?'No quotations created by you yet':'No quotations found')+'</p></div>':'')+'</div>'}
 
 function liRow(it){return'<div style="display:grid;grid-template-columns:1fr 70px 90px 30px;gap:6px;margin-bottom:6px;align-items:center" class="lir"><input class="ip" placeholder="Description" data-f="d" value="'+(it.desc||'')+'"><input class="ip" placeholder="Qty" type="number" data-f="q" value="'+(it.qty||1)+'" min="1"><input class="ip" placeholder="Rate" type="number" data-f="r" value="'+(it.rate||0)+'" min="0" step="0.01"><button onclick="this.parentElement.remove()" style="background:none;border:none;color:var(--no);cursor:pointer;font-size:13px"><i class="fas fa-times-circle"></i></button></div>'}
 function addLI(){document.getElementById('LI').insertAdjacentHTML('beforeend',liRow({desc:'',qty:1,rate:0}))}
@@ -550,7 +529,7 @@ function qForm(id){
   oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:18px">'+(q?'Edit':'New')+' Quotation</h3>'+
   '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">'+
     '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Quote #</label><input class="ip" id="qNo" value="'+(q?q.id:nx)+'" '+(q?'readonly':'')+'></div>'+
-    '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Client *</label><select class="ip" id="qCl">'+S.clients.map(c=>'<option value="'+c.id+'" '+(q&&q.clientId===c.id?'selected':'')+'>'+c.name+'</option>').join('')+'</select></div>'+
+    '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Client *</label><input class="ip" id="qCl" list="clientList" value="'+(q?q.clientName:'')+'"><datalist id="clientList">'+S.clients.map(c=>'<option value="'+c.name+'">').join('')+'</datalist></div>'+
     '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Valid Until</label><input class="ip" id="qVu" type="date" value="'+(q?q.validUntil:dd(14))+'"></div>'+
     '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Tax %</label><input class="ip" id="qTx" type="number" value="'+(q?((q.tax/(q.subtotal-q.discount))*100).toFixed(1):'5')+'" step="0.1"></div>'+
     '<div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Discount %</label><input class="ip" id="qDs" type="number" value="'+(q?((q.discount/q.subtotal)*100).toFixed(1):'0')+'" step="0.1"></div>'+
@@ -566,7 +545,7 @@ function qForm(id){
 
 async function svQ(id){
   const items=getLI(); if(!items.length){toast('Add items','e');return}
-  const cl=document.getElementById('qCl').value, clt=S.clients.find(c=>c.id===cl);
+  const cl=document.getElementById('qCl').value, clt=S.clients.find(c=>c.name===cl);
   const sub=items.reduce((s,i)=>s+i.amount,0);
   const dsr=parseFloat(document.getElementById('qDs')?.value)||0, ds=sub*dsr/100;
   const txr=parseFloat(document.getElementById('qTx').value)||0, tx=(sub-ds)*txr/100, tot=sub-ds+tx;
@@ -585,7 +564,7 @@ async function svQ(id){
 
   const d={
     id:document.getElementById('qNo').value,
-    clientId:cl, clientName:clt?clt.name:'Unknown',
+    clientId:clt?clt.id:null, clientName:cl||'Unknown',
     items, subtotal:sub, discount:ds, tax:tx, total:tot,
     attachments: attachments.length ? attachments : (id ? S.quotations.find(x=>x.id===id)?.attachments : []),
     validUntil:document.getElementById('qVu').value,
@@ -631,18 +610,29 @@ function revQ(id){const q=S.quotations.find(x=>x.id===id);if(q){q.status='pendin
    ========================================================= */
 function vLpos(e,a){
   const isAdminOrManager = ['admin','manager'].includes(S.role);
-  a.innerHTML= '<button class="bt bp" onclick="lForm()"><i class="fas fa-plus"></i> New LPO</button>';
-  const ls = S.lpos;
+  const isStaff = S.role === 'staff';
+  const isManager = S.role === 'manager';
+  
+  a.innerHTML = '<button class="bt bp" onclick="lForm()"><i class="fas fa-plus"></i> New LPO</button>' +
+    (isManager ? '<button class="bt bs" onclick="toggleMyDocs(\'l\')" style="margin-left:8px"><i class="fas fa-filter"></i> ' + (S.filterMyDocs ? 'All Docs' : 'My Docs') + '</button>' : '');
+  
+  let ls = S.lpos;
+  if (isStaff) {
+    ls = ls.filter(l => l.createdBy === S.user.name);
+  } else if (isManager && S.filterMyDocs) {
+    ls = ls.filter(l => l.createdBy === S.user.name);
+  }
   const cur = S.company.currency;
-e.innerHTML='<div style="margin-bottom:14px"><input class="ip" placeholder="Search..." oninput="fTbl(\'lT\',this.value)" style="max-width:280px"></div><div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse" id="lT"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">LPO #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Vendor</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Delivery</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Amount</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+ls.map(l=>'<tr class="tr" style="border-bottom:1px solid var(--bd)" data-n="'+(l.vendorName||'').toLowerCase()+'" data-s="'+l.status+'"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+l.id+'</td><td style="padding:10px 14px;font-size:12px">'+l.vendorName+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(l.deliveryDate)+'</td><td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right">'+cur+' '+fm(l.total)+'</td><td style="padding:10px 14px;text-align:center">'+tg(l.status)+'</td><td style="padding:10px 14px;text-align:right;white-space:nowrap">'+
+  e.innerHTML='<div style="margin-bottom:14px"><input class="ip" placeholder="Search..." oninput="fTbl(\'lT\',this.value)" style="max-width:280px"></div><div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse" id="lT"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">LPO #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Vendor</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Created By</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Delivery</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Amount</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+ls.map(l=>'<tr class="tr" style="border-bottom:1px solid var(--bd)" data-n="'+(l.vendorName||'').toLowerCase()+'" data-s="'+l.status+'"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+l.id+'</td><td style="padding:10px 14px;font-size:12px">'+l.vendorName+'</td><td style="padding:10px 14px;font-size:11px;color:var(--mt)"><i class="fas fa-user" style="margin-right:4px"></i>'+(l.createdBy||'—')+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(l.deliveryDate)+'</td><td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right">'+cur+' '+fm(l.total)+'</td><td style="padding:10px 14px;text-align:center">'+tg(l.status)+'</td><td style="padding:10px 14px;text-align:right;white-space:nowrap">'+
   (l.status==='pending' && isAdminOrManager ? '<button class="bt bgg bsm" title="Approve" onclick="appL(\''+l.id+'\')"><i class="fas fa-check"></i></button><button class="bt bdd bsm" title="Reject" onclick="rejL(\''+l.id+'\')"><i class="fas fa-times"></i></button>':'')+
   ((l.status==='pending' || l.status==='rejected') && (S.role==='staff' || isAdminOrManager) ? '<button class="bt bs bsm" title="Edit" onclick="lForm(\''+l.id+'\')"><i class="fas fa-edit"></i></button>':'')+
   (l.status==='approved' && isAdminOrManager ? '<button class="bt bp bsm" title="Send to Vendor" onclick="sendL(\''+l.id+'\')"><i class="fas fa-paper-plane"></i></button>':'')+
-  (l.status==='awaiting_delivery' ? '<button class="bt bs bsm" title="Create GRN" onclick="gFormFromLPO(\''+l.id+'\')"><i class="fas fa-boxes-stacked"></i></button>':'')+
+  ((['approved', 'sent', 'awaiting_delivery', 'partially_received'].includes(l.status)) ? '<button class="bt bs bsm" title="Create GRN" onclick="gFormFromLPO(\''+l.id+'\')"><i class="fas fa-boxes-stacked"></i></button>' : '')+
   (S.grns.some(g=>g.lpoId===l.id) ? '<button class="bt bs bsm" title="View Linked GRN" onclick="nav(\'grns\')"><i class="fas fa-truck-loading"></i></button>':'')+
   ((l.status==='awaiting_delivery' || l.status==='received') ? '<button class="bt bs bsm" title="PDF" onclick="genPDF(\'lpo\',\''+l.id+'\')"><i class="fas fa-file-pdf"></i></button>':'')+
   '<button class="bt bs bsm" title="History" onclick="vHist(\''+l.id+'\')"><i class="fas fa-history"></i></button>'+
-  '</td></tr>').join('')+'</tbody></table>'+( !ls.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-shopping-cart" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>No purchase orders yet</p></div>':'')+'</div>'}
+  '</td></tr>').join('')+'</tbody></table>'+(!ls.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-shopping-cart" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>'+(isStaff?'No LPOs created by you yet':'No purchase orders found')+'</p></div>':'')+'</div>';
+}
 
 function appL(id){
   oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:12px">Approve LPO</h3><textarea class="ip" id="lAppCm" placeholder="Approval comments (optional)" rows="3"></textarea><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px"><button class="bt bs" onclick="cM()">Cancel</button><button class="bt bgg" onclick="hAppL(\''+id+'\')">Confirm Approval</button></div></div>');
@@ -661,15 +651,15 @@ function hRejL(id){
 }
 function sendL(id){const l=S.lpos.find(x=>x.id===id);if(l){l.status='awaiting_delivery';persist('lpos', l);logAudit(id, 'Sent to Vendor', 'awaiting_delivery');genPDF('lpo',id);emailDoc('lpo',id);toast('LPO sent to vendor');rc()}}
 function lForm(id){const l=id?S.lpos.find(x=>x.id===id):null;const nx='LPO-'+String(S.lpos.length+1).padStart(3,'0');
-oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:18px">'+(l?'Edit':'New')+' Purchase Order</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px"><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">LPO #</label><input class="ip" id="lNo" value="'+(l?l.id:nx)+'" '+(l?'readonly':'')+'></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Vendor *</label><select class="ip" id="lVn">'+S.vendors.map(v=>'<option value="'+v.id+'" '+(l&&l.vendorId===v.id?'selected':'')+'>'+v.name+'</option>').join('')+'</select></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Delivery Date</label><input class="ip" id="lDd" type="date" value="'+(l?l.deliveryDate:dd(14))+'"></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Tax %</label><input class="ip" id="lTx" type="number" value="'+(l?((l.tax/l.subtotal)*100).toFixed(1):'5')+'" step="0.1"></div></div><h4 style="font-size:13px;font-weight:700;margin-bottom:6px">Line Items</h4><div id="LI">'+(l?l.items:[{desc:'',qty:1,rate:0}]).map(it=>liRow(it)).join('')+'</div><button class="bt bs bsm" onclick="addLI()" style="margin-top:6px"><i class="fas fa-plus"></i> Add Item</button><div style="margin-top:14px"><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Notes</label><textarea class="ip" id="lNt" rows="2">'+(l?l.notes||'':'')+'</textarea></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px"><button class="bt bs" onclick="cM()">Cancel</button><button class="bt bp" onclick="svL(\''+(id||'')+'\')"><i class="fas fa-save"></i> Save</button></div></div>')}
+oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:18px">'+(l?'Edit':'New')+' Purchase Order</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px"><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">LPO #</label><input class="ip" id="lNo" value="'+(l?l.id:nx)+'" '+(l?'readonly':'')+'></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Vendor *</label><input class="ip" id="lVn" list="vendorList" value="'+(l?l.vendorName:'')+'"><datalist id="vendorList">'+S.vendors.map(v=>'<option value="'+v.name+'">').join('')+'</datalist></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Delivery Date</label><input class="ip" id="lDd" type="date" value="'+(l?l.deliveryDate:dd(14))+'"></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Tax %</label><input class="ip" id="lTx" type="number" value="'+(l?((l.tax/l.subtotal)*100).toFixed(1):'5')+'" step="0.1"></div></div><h4 style="font-size:13px;font-weight:700;margin-bottom:6px">Line Items</h4><div id="LI">'+(l?l.items:[{desc:'',qty:1,rate:0}]).map(it=>liRow(it)).join('')+'</div><button class="bt bs bsm" onclick="addLI()" style="margin-top:6px"><i class="fas fa-plus"></i> Add Item</button><div style="margin-top:14px"><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Notes</label><textarea class="ip" id="lNt" rows="2">'+(l?l.notes||'':'')+'</textarea></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px"><button class="bt bs" onclick="cM()">Cancel</button><button class="bt bp" onclick="svL(\''+(id||'')+'\')"><i class="fas fa-save"></i> Save</button></div></div>')}
 
 function svL(id){
   const items=getLI(); if(!items.length){toast('Add items','e');return}
-  const vn=document.getElementById('lVn').value, vdr=S.vendors.find(v=>v.id===vn);
+  const vn=document.getElementById('lVn').value, vdr=S.vendors.find(v=>v.name===vn);
   const sub=items.reduce((s,i)=>s+i.amount,0), txr=parseFloat(document.getElementById('lTx').value)||0, tx=sub*txr/100, tot=sub+tx;
   const d={
     id:document.getElementById('lNo').value,
-    vendorId:vn, vendorName:vdr?vdr.name:'Unknown',
+    vendorId:vdr?vdr.id:null, vendorName:vn||'Unknown',
     items, subtotal:sub, tax:tx, total:tot,
     deliveryDate:document.getElementById('lDd').value,
     notes:document.getElementById('lNt').value.trim(),
@@ -690,17 +680,25 @@ function sendL(id){const l=S.lpos.find(x=>x.id===id);if(l){l.status='awaiting_de
    GOODS RECEIVED
    ========================================================= */
 function vGrns(e,a){
-  a.innerHTML= '<button class="bt bp" onclick="gForm()"><i class="fas fa-plus"></i> New GRN</button>';
+  const isManager = S.role === 'manager';
+  
+  a.innerHTML = '<button class="bt bp" onclick="gForm()"><i class="fas fa-plus"></i> New GRN</button>' +
+    (isManager ? '<button class="bt bs" onclick="toggleMyDocs(\'g\')" style="margin-left:8px"><i class="fas fa-filter"></i> ' + (S.filterMyDocs ? 'All Docs' : 'My Docs') + '</button>' : '');
 
-  // All roles see company-wide data
-  const grns = S.grns;
+  let grns = S.grns;
+  if (S.role === 'staff') {
+    grns = grns.filter(g => g.createdBy === S.user.name);
+  } else if (isManager && S.filterMyDocs) {
+    grns = grns.filter(g => g.createdBy === S.user.name);
+  }
 
-  e.innerHTML='<div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">GRN #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">LPO</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Vendor</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Date</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+grns.map(g=>'<tr class="tr" style="border-bottom:1px solid var(--bd)"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+g.id+'</td><td style="padding:10px 14px;font-size:12px">'+g.lpoNo+'</td><td style="padding:10px 14px;font-size:12px">'+g.vendorName+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(g.createdAt)+'</td><td style="padding:10px 14px;text-align:center">'+tg(g.status)+(g.discrepancy?'<div style="font-size:10px;color:var(--no);font-weight:700;margin-top:4px"><i class="fas fa-exclamation-triangle"></i> DISCREPANCY</div>':'')+'</td><td style="padding:10px 14px;text-align:right"><button class="bt bs bsm" title="PDF" onclick="genPDF(\'grn\',\''+g.id+'\')"><i class="fas fa-file-pdf"></i></button></td></tr>').join('')+'</tbody></table>'+( !grns.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-boxes-stacked" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>No GRNs yet</p></div>':'')+'</div>'}
+  e.innerHTML='<div class="cd" style="padding:0;overflow:hidden"><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f8fafc;border-bottom:2px solid var(--bd)"><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">GRN #</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">LPO</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Vendor</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Created By</th><th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Date</th><th style="text-align:center;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Status</th><th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Actions</th></tr></thead><tbody>'+grns.map(g=>'<tr class="tr" style="border-bottom:1px solid var(--bd)"><td style="padding:10px 14px;font-weight:600;font-size:13px">'+g.id+'</td><td style="padding:10px 14px;font-size:12px">'+g.lpoNo+'</td><td style="padding:10px 14px;font-size:12px">'+g.vendorName+'</td><td style="padding:10px 14px;font-size:11px;color:var(--mt)"><i class="fas fa-user" style="margin-right:4px"></i>'+(g.createdBy||'—')+'</td><td style="padding:10px 14px;font-size:12px;color:var(--mt)">'+fd(g.createdAt)+'</td><td style="padding:10px 14px;text-align:center">'+tg(g.status)+(g.discrepancy?'<div style="font-size:10px;color:var(--no);font-weight:700;margin-top:4px"><i class="fas fa-exclamation-triangle"></i> DISCREPANCY</div>':'')+'</td><td style="padding:10px 14px;text-align:right"><button class="bt bs bsm" title="PDF" onclick="genPDF(\'grn\',\''+g.id+'\')"><i class="fas fa-file-pdf"></i></button></td></tr>').join('')+'</tbody></table>'+(!grns.length?'<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-boxes-stacked" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>'+(S.role==='staff'?'No GRNs created by you yet':'No GRNs found')+'</p></div>':'')+'</div>';
+}
 
-function gForm(){const nx='GRN-'+String(S.grns.length+1).padStart(3,'0');const ol=S.lpos.filter(l=>['sent','awaiting_delivery','partially_received'].includes(l.status));
+function gForm(){const nx='GRN-'+String(S.grns.length+1).padStart(3,'0');const ol=S.lpos.filter(l=>['approved','sent','awaiting_delivery','partially_received'].includes(l.status));
 oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:18px">New Goods Received Note</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px"><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">GRN #</label><input class="ip" id="gNo" value="'+nx+'" readonly></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">LPO *</label><select class="ip" id="gLp" onchange="loadLpoI()">'+(ol.length?ol.map(l=>'<option value="'+l.id+'">'+l.id+' — '+l.vendorName+'</option>'):'<option value="">No open LPOs</option>')+'</select></div></div><h4 style="font-size:13px;font-weight:700;margin-bottom:6px">Items Received</h4><div id="GI"></div><div style="margin-top:10px"><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Discrepancy Notes</label><textarea class="ip" id="gDi" rows="2" placeholder="Short delivery, damages, etc."></textarea></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px"><button class="bt bs" onclick="cM()">Cancel</button><button class="bt bp" onclick="svG()"><i class="fas fa-save"></i> Save GRN</button></div></div>');setTimeout(loadLpoI,80)}
 
-function gFormFromLPO(lid){setTimeout(()=>{const s=document.getElementById('gLp');if(s){s.value=lid;loadLpoI()}},250)}
+function gFormFromLPO(lid){gForm();setTimeout(()=>{const s=document.getElementById('gLp');if(s){s.value=lid;loadLpoI()}},250)}
 
 function loadLpoI(){const lid=document.getElementById('gLp')?.value;const lpo=S.lpos.find(l=>l.id===lid);const c=document.getElementById('GI');if(!lpo||!c){if(c)c.innerHTML='<p style="color:var(--mt);font-size:12px;padding:8px 0">Select an open LPO above</p>';return}
 c.innerHTML='<div style="display:grid;grid-template-columns:1fr 60px 70px 100px;gap:5px;margin-bottom:3px"><span style="font-size:10px;font-weight:600;color:var(--mt)">Description</span><span style="font-size:10px;font-weight:600;color:var(--mt);text-align:center">Ordered</span><span style="font-size:10px;font-weight:600;color:var(--mt);text-align:center">Recvd</span><span style="font-size:10px;font-weight:600;color:var(--mt)">Condition</span></div>'+lpo.items.map(it=>'<div style="display:grid;grid-template-columns:1fr 60px 70px 100px;gap:5px;margin-bottom:5px;align-items:center" class="gir"><input class="ip" value="'+it.desc+'" data-f="d" readonly style="background:#f8fafc;font-size:12px;padding:6px"><input class="ip" value="'+it.qty+'" data-f="o" readonly style="background:#f8fafc;text-align:center;font-size:12px;padding:6px"><input class="ip" type="number" data-f="r" value="'+it.qty+'" min="0" oninput="this.style.color=parseInt(this.value)<'+it.qty+'?\'var(--no)\':\'\'" style="text-align:center;font-size:12px;padding:6px"><select class="ip" data-f="c" style="font-size:12px;padding:6px" onchange="this.style.color=this.value!==\'Good\'?\'var(--no)\':\'\'"><option value="Good">Good</option><option value="Damaged">Damaged</option><option value="Shortage">Shortage</option><option value="Wrong Item">Wrong Item</option></select></div>').join('')}
@@ -741,12 +739,18 @@ function svG(){
    ========================================================= */
 function vInv(e){
   const canRecordPayments = ['admin','manager'].includes(S.role);
+  const isManager = S.role === 'manager';
   const cur = S.company.currency;
 
-  // All roles see company-wide data
-  const invoices = S.invoices;
+  let invoices = S.invoices;
+  if (isManager && S.filterMyDocs) {
+    invoices = invoices.filter(inv => inv.createdBy === S.user.name);
+  }
 
-  e.innerHTML='<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
+  // Add "My Docs" button for managers - append to the header area
+  const filterBtn = isManager ? '<button class="bt bs" onclick="toggleMyDocs(\'i\')" style="margin-left:8px"><i class="fas fa-filter"></i> ' + (S.filterMyDocs ? 'All Docs' : 'My Docs') + '</button>' : '';
+  
+  e.innerHTML='<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center">' +
     '<input class="ip" placeholder="Search..." oninput="fTbl(\'iT\',this.value)" style="max-width:240px">' +
     '<select class="ip" style="max-width:140px" onchange="fTblS(\'iT\',this.value)">' +
       '<option value="">All Status</option>' +
@@ -755,6 +759,7 @@ function vInv(e){
       '<option value="paid">Paid</option>' +
       '<option value="overdue">Overdue</option>' +
     '</select>' +
+    filterBtn +
   '</div>' +
   '<div class="cd" style="padding:0;overflow:hidden">' +
     '<table style="width:100%;border-collapse:collapse" id="iT">' +
@@ -763,6 +768,7 @@ function vInv(e){
           '<th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Invoice #</th>' +
           '<th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Client</th>' +
           '<th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Quote</th>' +
+          '<th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Created By</th>' +
           '<th style="text-align:left;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Due</th>' +
           '<th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Total</th>' +
           '<th style="text-align:right;padding:12px 14px;font-size:10px;font-weight:700;color:var(--mt);text-transform:uppercase">Balance</th>' +
@@ -777,6 +783,7 @@ function vInv(e){
           '<td style="padding:10px 14px;font-weight:600;font-size:13px">' + inv.id + '</td>' +
           '<td style="padding:10px 14px;font-size:12px">' + inv.clientName + '</td>' +
           '<td style="padding:10px 14px;font-size:12px;color:var(--mt)">' + (inv.quotationId || '—') + '</td>' +
+          '<td style="padding:10px 14px;font-size:11px;color:var(--mt)"><i class="fas fa-user" style="margin-right:4px"></i>' + (inv.createdBy || '—') + '</td>' +
           '<td style="padding:10px 14px;font-size:12px;color:var(--mt)">' + fd(inv.dueDate) + '</td>' +
           '<td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right">' + cur + ' ' + fm(inv.total) + '</td>' +
           '<td style="padding:10px 14px;font-size:12px;font-weight:600;text-align:right;color:' + (bal > 0 ? 'var(--no)' : 'var(--ok)') + '">' + cur + ' ' + fm(bal) + '</td>' +
@@ -790,7 +797,7 @@ function vInv(e){
       }).join('') +
     '</tbody>' +
   '</table>' +
-  (invoices.length ? '' : '<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-file-invoice-dollar" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>No invoices yet</p></div>') +
+  (invoices.length ? '' : '<div style="padding:30px;text-align:center;color:var(--mt)"><i class="fas fa-file-invoice-dollar" style="font-size:28px;opacity:.3;margin-bottom:6px"></i><p>' + (isManager && S.filterMyDocs ? 'No invoices created by you yet' : 'No invoices found') + '</p></div>') +
 '</div>';
 } // ← closes vInv
 
@@ -830,10 +837,78 @@ function vUsers(e,a){
 
 function uForm(id){const u=id?S.users.find(x=>x.id===id):null;oM('<div style="padding:22px"><h3 style="font-size:17px;font-weight:800;margin-bottom:18px">'+(u?'Edit':'Add')+' User</h3><div style="display:grid;gap:10px"><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Name *</label><input class="ip" id="un" value="'+(u?u.name:'')+'"></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Email *</label><input class="ip" id="ue" type="email" value="'+(u?u.email:'')+'"></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Password '+(u?'(leave blank to keep)':'*')+'</label><input class="ip" id="up" type="password" placeholder="'+(u?'********':'Set password')+'"></div><div><label style="font-size:11px;font-weight:600;color:var(--mt);display:block;margin-bottom:3px">Role</label><select class="ip" id="ur"><option value="admin" '+(u&&u.role==='admin'?'selected':'')+'>Admin</option><option value="manager" '+(u&&u.role==='manager'?'selected':'')+'>Manager</option><option value="finance" '+(u&&u.role==='finance'?'selected':'')+'>Finance</option><option value="staff" '+(u&&u.role==='staff'?'selected':'')+'>Staff</option></select></div></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px"><button class="bt bs" onclick="cM()">Cancel</button><button class="bt bp" onclick="svU(\''+(id||'')+'\')"><i class="fas fa-save"></i> Save</button></div></div>')}
 
-function svU(id){const n=document.getElementById('un').value.trim(),em=document.getElementById('ue').value.trim(),p=document.getElementById('up').value.trim(),r=document.getElementById('ur').value;if(!n||!em||(!id && !p)){toast('Fill all required fields','e');return}if(id){const i=S.users.findIndex(u=>u.id===id);if(i>=0){S.users[i]={...S.users[i],name:n,email:em,role:r};if(p) S.users[i].password=p;persist('users', S.users[i])}}else{const u={id:uid(),name:n,email:em,password:p,role:r,company_id:S.cid};S.users.push(u);persist('users', u)}cM();toast('Saved');rc()}
+function svU(id) {
+  const n = document.getElementById('un').value.trim();
+  const em = document.getElementById('ue').value.trim();
+  const p = document.getElementById('up').value.trim();
+  const r = document.getElementById('ur').value;
+
+  if (!n || !em || (!id && !p)) {
+    toast('Fill all required fields', 'e');
+    return;
+  }
+
+  const token = S.token;
+  const headers = {
+    'Content-Type': 'application/json'
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  if (id) {
+    const updateData = { name: n, email: em, role: r };
+    if (p) updateData.password = p;
+
+    fetch(`${API}/admin/users/${id}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(updateData)
+    })
+    .then(resp => resp.json())
+    .then(data => {
+      if (data.error) {
+        toast(data.error, 'e');
+      } else {
+        const i = S.users.findIndex(u => u.id === id);
+        if (i >= 0) {
+          S.users[i] = { ...S.users[i], name: n, email: em, role: r };
+        }
+        cM();
+        toast('User updated');
+        rc();
+      }
+    })
+    .catch(err => {
+      console.error('Update user error:', err);
+      toast('Failed to update user', 'e');
+    });
+  } else {
+    fetch(`${API}/admin/users`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: n, email: em, password: p, role: r })
+    })
+    .then(resp => resp.json())
+    .then(data => {
+      if (data.error) {
+        toast(data.error, 'e');
+      } else if (data.user) {
+        S.users.push(data.user);
+        cM();
+        toast('User created successfully');
+        rc();
+      }
+    })
+    .catch(err => {
+      console.error('Create user error:', err);
+      toast('Failed to create user', 'e');
+    });
+  }
+}
 
 function vSet(e){
-e.innerHTML='<div style="max-width:600px;display:flex;flex-direction:column;gap:16px"><div class="cd fu"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-plug" style="color:var(--ac);margin-right:6px"></i>Firebase Connection</h3><div style="display:flex;align-items:center;gap:6px;margin-bottom:10px"><span style="width:8px;height:8px;border-radius:50%;display:inline-block;background:'+(S.fbReady?'var(--ok)':'#94a3b8')+';'+(S.fbReady?'animation:pls 2s infinite':'')+'"></span><span style="font-size:12px;font-weight:600;color:'+(S.fbReady?'var(--ok)':'var(--mt)')+'">'+(S.fbReady?'Connected to lpo-manager-johnzz-2026':'Offline Mode — Firebase unavailable')+'</span></div>'+(S.fbError?'<div class="err-box" style="margin-top:8px"><i class="fas fa-exclamation-circle"></i> '+S.fbError+'</div>':'')+'<p style="font-size:11px;color:var(--mt);margin-top:8px">'+(S.fbReady?'Firebase Authentication and Firestore are active. All data syncs to the cloud automatically.':'The app is running in offline mode. Data is stored in your browser only. To enable cloud sync, make sure Firebase Authentication is enabled in your Firebase Console.')+'</p></div><div class="cd fu" style="animation-delay:.05s"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-database" style="color:var(--ac);margin-right:6px"></i>Data Management</h3><p style="font-size:11px;color:var(--mt);margin-bottom:10px">Export or clear all business data.</p><div style="display:flex;gap:8px"><button class="bt bs" onclick="exportData()"><i class="fas fa-download"></i> Export JSON</button><button class="bt bdd" onclick="clearData()"><i class="fas fa-trash"></i> Clear All Data</button></div></div><div class="cd fu" style="animation-delay:.1s"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-info-circle" style="color:var(--ac);margin-right:6px"></i>System Info</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px"><div>Version:</div><div>1.0.0</div><div>User:</div><div>'+(S.user?.name||'None')+'</div><div>Role:</div><div style="text-transform:capitalize">'+(S.role||'None')+'</div><div>Company:</div><div>'+(S.company?.name||'None')+'</div><div>Firebase:</div><div>'+(S.fbReady?'Enabled':'Disabled')+'</div><div>Data Sync:</div><div>'+(S.fbReady?'Active':'Local Only')+'</div></div></div>'}
+e.innerHTML='<div style="max-width:600px;display:flex;flex-direction:column;gap:16px"><div class="cd fu"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-plug" style="color:var(--ac);margin-right:6px"></i>Supabase Connection</h3><div style="display:flex;align-items:center;gap:6px;margin-bottom:10px"><span style="width:8px;height:8px;border-radius:50%;display:inline-block;background:'+(S.apiReady?'var(--ok)':'#94a3b8')+';'+(S.apiReady?'animation:pls 2s infinite':'')+'"></span><span style="font-size:12px;font-weight:600;color:'+(S.apiReady?'var(--ok)':'var(--mt)')+'">'+(S.apiReady?'Connected to Supabase':'Offline Mode — API unavailable')+'</span></div><p style="font-size:11px;color:var(--mt);margin-top:8px">'+(S.apiReady?'Supabase PostgreSQL and API are active. All data syncs to the cloud automatically.':'The app is running in offline mode. Data is stored in your browser only.')+'</p></div><div class="cd fu" style="animation-delay:.05s"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-database" style="color:var(--ac);margin-right:6px"></i>Data Management</h3><p style="font-size:11px;color:var(--mt);margin-bottom:10px">Export or clear all business data.</p><div style="display:flex;gap:8px"><button class="bt bs" onclick="exportData()"><i class="fas fa-download"></i> Export JSON</button><button class="bt bdd" onclick="clearData()"><i class="fas fa-trash"></i> Clear All Data</button></div></div><div class="cd fu" style="animation-delay:.1s"><h3 style="font-size:15px;font-weight:800;margin-bottom:14px"><i class="fas fa-info-circle" style="color:var(--ac);margin-right:6px"></i>System Info</h3><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:12px"><div>Version:</div><div>1.0.0</div><div>User:</div><div>'+(S.user?.name||'None')+'</div><div>Role:</div><div style="text-transform:capitalize">'+(S.role||'None')+'</div><div>Company:</div><div>'+(S.company?.name||'None')+'</div><div>Firebase:</div><div>'+(S.fbReady?'Enabled':'Disabled')+'</div><div>Data Sync:</div><div>'+(S.fbReady?'Active':'Local Only')+'</div></div></div>'}
 
 function exportData(){const d={company:S.company,vendors:S.vendors,clients:S.clients,quotations:S.quotations,lpos:S.lpos,grns:S.grns,invoices:S.invoices,payments:S.payments,users:S.users};const b=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='bizflow-backup-'+td()+'.json';a.click();toast('Data exported')}
 
@@ -922,19 +997,54 @@ toast('PDF generated — email client opened');
 /* =========================================================
    APP INITIALIZATION — RUNS LAST, SURVIVES FIREBASE ERRORS
    ========================================================= */
-(function init() {
-  initFB(); // Initialize SQL connection check
+async function validateSession() {
+  const localSession = ld('session');
+  if (!localSession || !localSession.token) return null;
 
-  const session = ld('session');
-  if (session && session.email && session.cid) {
-    (async () => {
-      S.cid = session.cid;
-      await loadCloudData();
-      const u = S.users.find(x => x.email === session.email) || (session.email === 'admin@admin.com' ? {id:'admin_primary', name:'System Admin', email:'admin@admin.com', role:'admin'} : null);
-      if (u) { S.user = u; S.role = u.role; render() }
-      else { rAuth() }
-    })();
-  } else {
+  try {
+    const resp = await fetch(`${API}/auth/me`, {
+      headers: { 'Authorization': `Bearer ${localSession.token}` }
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      return data.user;
+    }
+    return null;
+  } catch (e) {
+    console.warn('Session validation failed:', e);
+    return null;
+  }
+}
+
+function doInit() {
+  try {
+    initAPI();
+
+    validateSession().then(user => {
+      if (user) {
+        S.token = ld('session')?.token;
+        S.user = user;
+        S.role = user.role;
+        S.cid = user.companyId;
+        loadCloudData().then(() => render());
+      } else {
+        sv('session', null);
+        rAuth();
+      }
+    }).catch(err => {
+      console.error('Init error:', err);
+      sv('session', null);
+      rAuth();
+    });
+  } catch (err) {
+    console.error('Init error:', err);
     rAuth();
   }
-})();
+}
+
+// Run immediately or when DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', doInit);
+} else {
+  doInit();
+}
